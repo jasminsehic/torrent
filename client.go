@@ -380,6 +380,7 @@ func (cl *Client) init(cfg *ClientConfig) {
 	cl.websocketTrackers = websocketTrackers{
 		PeerId: cl.peerID,
 		Slogger: cl.slogger.With("name", "websocketTrackers"),
+		RetryInterval: cl.config.failedAnnounceInterval,
 		GetAnnounceRequest: func(
 			event tracker.AnnounceEvent, infoHash [20]byte,
 		) (
