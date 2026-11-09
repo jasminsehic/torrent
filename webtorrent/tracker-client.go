@@ -22,8 +22,9 @@ import (
 
 const (
 	// Matches gorilla/websocket's DefaultDialer.HandshakeTimeout, which was used previously.
-	handshakeTimeout = 45 * time.Second
-	pingTimeout      = 30 * time.Second
+	handshakeTimeout        = 45 * time.Second
+	pingTimeout             = 30 * time.Second
+	minimumAnnounceInterval = time.Minute
 )
 
 type TrackerClientStats struct {
@@ -36,6 +37,7 @@ type TrackerClientStats struct {
 type TrackerClient struct {
 	Url                string
 	GetAnnounceRequest func(_ tracker.AnnounceEvent, infoHash [20]byte) (tracker.AnnounceRequest, error)
+	RetryInterval      func(int) time.Duration
 	PeerId             [20]byte
 	OnConn             onDataChannelOpen
 	// Deprecated: Use Slogger.
@@ -45,13 +47,15 @@ type TrackerClient struct {
 	// the browser's WebSocket is used.
 	HTTPClient *http.Client
 
-	mu             sync.Mutex
-	cond           sync.Cond
-	outboundOffers map[string]outboundOfferValue // OfferID to outboundOfferValue
-	wsConn         *websocket.Conn
-	closed         bool
-	stats          TrackerClientStats
-	pingTicker     *time.Ticker
+	mu               sync.Mutex
+	cond             sync.Cond
+	outboundOffers   map[string]outboundOfferValue // OfferID to outboundOfferValue
+	announces        map[[20]byte]*websocketAnnounce
+	hasConnected     bool
+	wsConn           *websocket.Conn
+	closed           bool
+	stats            TrackerClientStats
+	pingTicker       *time.Ticker
 
 	WebsocketTrackerHttpHeader func() http.Header
 	ICEServers                 []webrtc.ICEServer
@@ -99,6 +103,15 @@ type outboundOfferValue struct {
 	dataChannel    *webrtc.DataChannel
 }
 
+type websocketAnnounce struct {
+	interval  time.Duration
+	timer     *time.Timer
+	inFlight  bool
+	pending   bool
+	announced bool
+	failures  int
+}
+
 type DataChannelContext struct {
 	OfferId      string
 	LocalOffered bool
@@ -140,9 +153,13 @@ func (tc *TrackerClient) doWebsocket() error {
 	tc.slogger().Debug("connected")
 	tc.mu.Lock()
 	tc.wsConn = c
+	reconnecting := tc.hasConnected
+	tc.hasConnected = true
 	tc.cond.Broadcast()
 	tc.mu.Unlock()
-	tc.announceOffers()
+	if reconnecting {
+		tc.announceOffers()
+	}
 	closeChan := make(chan struct{})
 	go func() {
 		for {
@@ -168,6 +185,9 @@ func (tc *TrackerClient) doWebsocket() error {
 	close(closeChan)
 	tc.mu.Lock()
 	c.CloseNow()
+	if tc.wsConn == c {
+		tc.wsConn = nil
+	}
 	tc.mu.Unlock()
 	return err
 }
@@ -204,32 +224,45 @@ func (tc *TrackerClient) Close() error {
 		tc.wsConn.CloseNow()
 	}
 	tc.closeUnusedOffers()
-	tc.pingTicker.Stop()
+	for _, announce := range tc.announces {
+		if announce.timer != nil {
+			announce.timer.Stop()
+		}
+	}
+	tc.announces = nil
+	if tc.pingTicker != nil {
+		tc.pingTicker.Stop()
+	}
 	tc.mu.Unlock()
 	tc.cond.Broadcast()
 	return nil
 }
 
 func (tc *TrackerClient) announceOffers() {
-	// tc.Announce grabs a lock on tc.outboundOffers. It also handles the case where outboundOffers
-	// is nil. Take ownership of outboundOffers here.
+	// tc.Announce also takes tc.mu. Take ownership of outboundOffers under the lock,
+	// including when it is nil, before reannouncing.
 	tc.mu.Lock()
 	offers := tc.outboundOffers
 	tc.outboundOffers = nil
+	infoHashes := make([][20]byte, 0, len(tc.announces))
+	for infoHash, announce := range tc.announces {
+		if announce.timer != nil {
+			announce.timer.Stop()
+		}
+		infoHashes = append(infoHashes, infoHash)
+	}
 	tc.mu.Unlock()
 
-	if offers == nil {
-		return
-	}
-
-	// Iterate over our locally-owned offers, close any existing "invalid" ones from before the
-	// socket reconnected, reannounce the infohash, adding it back into the tc.outboundOffers.
-	tc.slogger().Info("reannouncing infohashes after restart", "count", len(offers))
+	// Close the outstanding offers from the old socket; they are no longer valid after reconnecting.
 	for _, offer := range offers {
-		// TODO: Capture the errors? Are we even in a position to do anything with them?
 		offer.peerConnection.Close()
+		offer.dataChannel.Close()
+	}
+	// Reannounce all registered torrents, including those without outstanding offers.
+	for _, infoHash := range infoHashes {
+		// TODO: Capture the errors? Are we even in a position to do anything with them?
 		// Use goroutine here to allow read loop to start and ensure the buffer drains.
-		go tc.Announce(tracker.Started, offer.infoHash)
+		go tc.Announce(tracker.Started, infoHash)
 	}
 }
 
@@ -244,21 +277,129 @@ func (tc *TrackerClient) closeUnusedOffers() {
 func (tc *TrackerClient) CloseOffersForInfohash(infoHash [20]byte) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
+	if announce, ok := tc.announces[infoHash]; ok {
+		if announce.timer != nil {
+			announce.timer.Stop()
+		}
+		delete(tc.announces, infoHash)
+		tc.cond.Broadcast()
+	}
 	for key, offer := range tc.outboundOffers {
 		if offer.infoHash == infoHash {
 			offer.peerConnection.Close()
+			offer.dataChannel.Close()
 			delete(tc.outboundOffers, key)
 		}
 	}
 }
 
+// Register tracks a torrent independently of whether an announce succeeds.
+func (tc *TrackerClient) Register(infoHash [20]byte) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.closed {
+		return
+	}
+	g.MakeMapIfNil(&tc.announces)
+	if tc.announces[infoHash] == nil {
+		tc.announces[infoHash] = &websocketAnnounce{interval: minimumAnnounceInterval}
+	}
+}
+
+// Caller holds tc.mu.
+func (tc *TrackerClient) scheduleAnnounce(infoHash [20]byte, delay time.Duration) {
+	announce := tc.announces[infoHash]
+	if announce == nil {
+		return
+	}
+	if announce.timer != nil {
+		announce.timer.Stop()
+	}
+	announce.timer = time.AfterFunc(delay, func() {
+		tc.mu.Lock()
+		if tc.closed || tc.announces[infoHash] != announce {
+			tc.mu.Unlock()
+			return
+		}
+		event := tracker.None
+		if !announce.announced {
+			event = tracker.Started
+		}
+		tc.mu.Unlock()
+		_ = tc.announceWithOffer(event, infoHash, false)
+	})
+}
+
+func (tc *TrackerClient) retryInterval(failures int) time.Duration {
+	if tc.RetryInterval != nil {
+		return tc.RetryInterval(failures)
+	}
+	return time.Minute
+}
+
 func (tc *TrackerClient) Announce(event tracker.AnnounceEvent, infoHash [20]byte) error {
-	metrics.Add("outbound announces", 1)
+	return tc.announceWithOffer(event, infoHash, true)
+}
+
+func (tc *TrackerClient) announceWithOffer(event tracker.AnnounceEvent, infoHash [20]byte, withOffer bool) (err error) {
 	if event == tracker.Stopped {
-		return tc.announce(event, infoHash, nil)
+		tc.CloseOffersForInfohash(infoHash)
+		return tc.announce(event, infoHash, nil, nil)
+	}
+
+	tc.mu.Lock()
+	announce := tc.announces[infoHash]
+	if tc.closed || (tc.announces != nil && announce == nil) {
+		tc.mu.Unlock()
+		return fmt.Errorf("torrent is no longer registered with websocket tracker")
+	}
+	if announce != nil {
+		if announce.inFlight {
+			if withOffer {
+				announce.pending = true
+			}
+			tc.mu.Unlock()
+			return nil
+		}
+		announce.inFlight = true
+		if announce.timer != nil {
+			announce.timer.Stop()
+			announce.timer = nil
+		}
+	}
+	tc.mu.Unlock()
+	if announce != nil {
+		defer func() {
+			tc.mu.Lock()
+			if tc.closed || tc.announces[infoHash] != announce {
+				tc.mu.Unlock()
+				return
+			}
+			announce.inFlight = false
+			delay := announce.interval
+			if err != nil {
+				announce.failures++
+				delay = tc.retryInterval(announce.failures)
+			} else {
+				announce.failures = 0
+				announce.announced = true
+			}
+			pending := announce.pending
+			announce.pending = false
+			tc.scheduleAnnounce(infoHash, delay)
+			tc.mu.Unlock()
+			if pending && err == nil {
+				go tc.Announce(tracker.None, infoHash)
+			}
+		}()
+	}
+
+	metrics.Add("outbound announces", 1)
+	if !withOffer {
+		return tc.announce(event, infoHash, nil, announce)
 	}
 	var randOfferId [20]byte
-	_, err := rand.Read(randOfferId[:])
+	_, err = rand.Read(randOfferId[:])
 	if err != nil {
 		return fmt.Errorf("generating offer_id bytes: %w", err)
 	}
@@ -272,7 +413,6 @@ func (tc *TrackerClient) Announce(event tracker.AnnounceEvent, infoHash [20]byte
 	// save the leecher peer connections
 	tc.storePeerConnection(fmt.Sprintf("%x", randOfferId[:]), pc)
 
-
 	tc.slogger().Debug("announcing offer")
 	err = tc.announce(event, infoHash, []outboundOffer{{
 		offerId: offerIDBinary,
@@ -281,8 +421,8 @@ func (tc *TrackerClient) Announce(event tracker.AnnounceEvent, infoHash [20]byte
 			peerConnection: pc,
 			infoHash:       infoHash,
 			dataChannel:    dc,
-		}},
-	})
+		},
+	}}, announce)
 	if err != nil {
 		dc.Close()
 		pc.Close()
@@ -297,7 +437,7 @@ func (tc *TrackerClient) removePeerConn(key string) {
 	delete(tc.rtcPeerConns, key)
 }
 
-func (tc *TrackerClient) announce(event tracker.AnnounceEvent, infoHash [20]byte, offers []outboundOffer) error {
+func (tc *TrackerClient) announce(event tracker.AnnounceEvent, infoHash [20]byte, offers []outboundOffer, registration *websocketAnnounce) error {
 	request, err := tc.GetAnnounceRequest(event, infoHash)
 	if err != nil {
 		tc.OnAnnounceError(infohash.T(infoHash).HexString(), err)
@@ -333,7 +473,7 @@ func (tc *TrackerClient) announce(event tracker.AnnounceEvent, infoHash [20]byte
 	}
 
 	tc.mu.Lock()
-	err = tc.writeMessage(data)
+	err = tc.writeMessage(data, infoHash, registration)
 	if err != nil {
 		tc.mu.Unlock()
 		tc.OnAnnounceError(infohash.T(infoHash).HexString(), err)
@@ -361,14 +501,19 @@ func (tc *TrackerClient) RtcPeerConnStats() map[string]webrtc.StatsReport {
 	return sr
 }
 
-func (tc *TrackerClient) writeMessage(data []byte) error {
-	for tc.wsConn == nil {
+func (tc *TrackerClient) writeMessage(data []byte, infoHash [20]byte, registration *websocketAnnounce) error {
+	for {
 		if tc.closed {
 			return fmt.Errorf("%T closed", tc)
 		}
+		if registration != nil && tc.announces[infoHash] != registration {
+			return fmt.Errorf("torrent is no longer registered with websocket tracker")
+		}
+		if tc.wsConn != nil {
+			return tc.wsConn.Write(context.Background(), websocket.MessageText, data)
+		}
 		tc.cond.Wait()
 	}
-	return tc.wsConn.Write(context.Background(), websocket.MessageText, data)
 }
 
 func (tc *TrackerClient) trackerReadLoop(tracker *websocket.Conn) error {
@@ -383,6 +528,26 @@ func (tc *TrackerClient) trackerReadLoop(tracker *websocket.Conn) error {
 		if err := json.Unmarshal(message, &ar); err != nil {
 			tc.slogger().Warn("error unmarshalling announce response", "err", err)
 			continue
+		}
+		if ar.FailureReason != "" {
+			if infoHash, err := jsonStringToInfoHash(ar.InfoHash); err == nil && tc.OnAnnounceError != nil {
+				tc.OnAnnounceError(infohash.T(infoHash).HexString(),
+					fmt.Errorf("websocket tracker rejected announce: %s", ar.FailureReason))
+			}
+			continue
+		}
+		if ar.Interval != nil && *ar.Interval > 0 {
+			if infoHash, err := jsonStringToInfoHash(ar.InfoHash); err == nil {
+				interval := max(time.Duration(*ar.Interval)*time.Second, minimumAnnounceInterval)
+				tc.mu.Lock()
+				if announce := tc.announces[infoHash]; announce != nil {
+					announce.interval = interval
+					if !announce.inFlight {
+						tc.scheduleAnnounce(infoHash, interval)
+					}
+				}
+				tc.mu.Unlock()
+			}
 		}
 		switch {
 		case ar.Offer != nil:
@@ -446,7 +611,7 @@ func (tc *TrackerClient) handleOffer(
 	}
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-	if err := tc.writeMessage(data); err != nil {
+	if err := tc.writeMessage(data, offerContext.InfoHash, nil); err != nil {
 		peerConnection.Close()
 		return fmt.Errorf("writing response: %w", err)
 	}
