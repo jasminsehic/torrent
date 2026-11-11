@@ -1,9 +1,11 @@
 package webtorrent
 
 import (
+	"bufio"
 	"context"
 	"expvar"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -261,10 +263,20 @@ func initDataChannel(
 type DataChannelConn struct {
 	ioCloserFunc
 	rawDataChannel datachannel.ReadWriteCloser
+	streamReader *bufio.Reader
+}
+
+// Pion exposes message-oriented reads. A BitTorrent handshake may be read
+// one byte at a time, so a direct read with the caller\x27s small buffer would
+// discard a whole larger SCTP message with io.ErrShortBuffer.
+const rtcReadBufferSize = 256 * 1024
+
+func newDataChannelStreamReader(raw io.Reader) *bufio.Reader {
+	return bufio.NewReaderSize(raw, rtcReadBufferSize)
 }
 
 func (d DataChannelConn) Read(p []byte) (int, error) {
-	return d.rawDataChannel.Read(p)
+	return d.streamReader.Read(p)
 }
 
 // Limit write size for WebRTC data channels. See https://github.com/pion/datachannel/issues/59. The
@@ -316,5 +328,6 @@ func wrapDataChannel(
 			return nil
 		}),
 		rawDataChannel: dcrwc,
+		streamReader: newDataChannelStreamReader(dcrwc),
 	}
 }
