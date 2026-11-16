@@ -8,6 +8,7 @@ import (
 	netHttp "net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/anacrolix/log"
 	"github.com/pion/webrtc/v4"
@@ -47,6 +48,7 @@ type websocketTrackers struct {
 	Logger                     log.Logger
 	Slogger                    *slog.Logger
 	GetAnnounceRequest         func(event tracker.AnnounceEvent, infoHash [20]byte) (tracker.AnnounceRequest, error)
+	RetryInterval              func(int) time.Duration
 	OnConn                     func(webtorrent.DataChannelConn, webtorrent.DataChannelContext)
 	mu                         sync.Mutex
 	clients                    map[string]*refCountedWebtorrentTrackerClient
@@ -83,6 +85,7 @@ func (me *websocketTrackers) Get(url string, infoHash [20]byte) (*webtorrent.Tra
 				HTTPClient:                 httpClient,
 				Url:                        url,
 				GetAnnounceRequest:         me.GetAnnounceRequest,
+				RetryInterval:              me.RetryInterval,
 				PeerId:                     me.PeerId,
 				OnConn:                     me.OnConn,
 				Slogger:                    me.slogger().With("trackerClientUrl", url),
@@ -127,17 +130,20 @@ func (me *websocketTrackers) Get(url string, infoHash [20]byte) (*webtorrent.Tra
 				},
 			},
 		}
-		value.TrackerClient.Start(func(err error) {
-			if err != nil {
-				me.slogger().Error("error running tracker client", "url", url, "err", err)
-			}
-		})
 		if me.clients == nil {
 			me.clients = make(map[string]*refCountedWebtorrentTrackerClient)
 		}
 		me.clients[url] = value
 	}
 	value.refCount++
+	value.TrackerClient.Register(infoHash)
+	if !ok {
+		value.TrackerClient.Start(func(err error) {
+			if err != nil {
+				me.slogger().Error("error running tracker client", "url", url, "err", err)
+			}
+		})
+	}
 	return &value.TrackerClient, func() {
 		me.mu.Lock()
 		defer me.mu.Unlock()

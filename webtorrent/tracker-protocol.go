@@ -25,16 +25,17 @@ type Offer struct {
 }
 
 type AnnounceResponse struct {
-	InfoHash   string                     `json:"info_hash"`
-	Action     string                     `json:"action"`
-	Interval   *int                       `json:"interval,omitempty"`
-	Complete   *int                       `json:"complete,omitempty"`
-	Incomplete *int                       `json:"incomplete,omitempty"`
-	PeerID     string                     `json:"peer_id,omitempty"`
-	ToPeerID   string                     `json:"to_peer_id,omitempty"`
-	Answer     *webrtc.SessionDescription `json:"answer,omitempty"`
-	Offer      *webrtc.SessionDescription `json:"offer,omitempty"`
-	OfferID    string                     `json:"offer_id,omitempty"`
+	InfoHash      string                     `json:"info_hash"`
+	Action        string                     `json:"action"`
+	Interval      *int                       `json:"interval,omitempty"`
+	Complete      *int                       `json:"complete,omitempty"`
+	Incomplete    *int                       `json:"incomplete,omitempty"`
+	PeerID        string                     `json:"peer_id,omitempty"`
+	ToPeerID      string                     `json:"to_peer_id,omitempty"`
+	Answer        *webrtc.SessionDescription `json:"answer,omitempty"`
+	Offer         *webrtc.SessionDescription `json:"offer,omitempty"`
+	OfferID       string                     `json:"offer_id,omitempty"`
+	FailureReason string                     `json:"failure reason,omitempty"`
 }
 
 // I wonder if this is a defacto standard way to decode bytes to JSON for webtorrent. I don't really
